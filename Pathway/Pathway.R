@@ -1,0 +1,154 @@
+library(clusterProfiler)
+library(fgsea)
+library(ggplot2)
+library(ggpubr)  
+library(dplyr)
+library(signatureSearch)
+library(dplyr)
+library(DESeq2)
+library(ggrepel)
+#############################
+
+exp <- read.delim("D:/BulkRNA/Data/data_mrna_seq_v2_rsem.txt")
+exp<- na.omit(exp)
+exp<- data.frame(t(exp))
+
+colnames(exp) <- exp[ 1,]
+exp<- exp[-1:-2, ]
+
+################PatientInfo 
+PatientInfo <- read.delim("D:/BulkRNA/Data/tcga_clinical_data.tsv")
+PatientInfo$Sample.ID <- gsub("-" ,"." , PatientInfo$Sample.ID)
+
+## Defining a new column named Er.status
+exp$ER.status <- PatientInfo$ER.Status.By.IHC[match(rownames(exp), PatientInfo$Sample.ID)]
+exp<- na.omit(exp)
+exp<- exp[exp$ER.status!="Indeterminate",]
+
+
+#############Creating a metadata table with information of our samples 
+
+metadata<- as.data.frame(cbind(rownames(exp), exp[,"ER.status"]))
+colnames(metadata)<- c("Sample.ID", "ER")
+
+#####Deleting last column(the genes' names) of exp
+expression_data<-  exp[,-20531]
+expression_data <- data.frame(lapply(expression_data, as.numeric))
+expression_data<-as.data.frame(log2(expression_data+1)) # Adding 1 to avoid log(0)
+expression_data<- round(expression_data)  # DESeq only accepts round data 
+expression_data<- as.data.frame(t(expression_data))
+
+######################################Create dds object by DESeqDataSet function
+
+dds<-DESeqDataSetFromMatrix(countData=expression_data,colData=metadata,design=~ER)
+
+dds <- DESeq(dds)
+
+My_Results<- results(dds)
+My_Results_df<- as.data.frame(My_Results)
+
+My_Results_df$GeneName <- rownames(My_Results_df)
+
+Genes_in_data <- My_Results_df$GeneName
+
+My_Results_df <- na.omit(My_Results_df)
+
+###########################
+# If you forgot to do that before, annotate according to differential expression
+My_Results_df <- My_Results_df %>% mutate(diffexpressed = case_when(
+  log2FoldChange       > 0 & padj < 0.05 ~ 'Up',
+  log2FoldChange       < 0 & padj < 0.05 ~ 'Down',
+  padj > 0.05 ~ 'NO'
+  
+))
+
+My_Results_df<-My_Results_df[My_Results_df$diffexpressed !='NO',]
+
+# Split the dataframe into a list of sub-dataframes: upregulated, downregulated genes
+deg_results_list <- split(My_Results_df, My_Results_df$diffexpressed)
+
+
+# Load MSigDB Hallmark gene sets
+hallmark_gene_sets <- read.gmt("h.all.v2023.2.Hs.symbols.gmt")
+
+
+hallmark_gene_sets2 <- hallmark_gene_sets[hallmark_gene_sets$gene %in% Genes_in_data,] 
+
+#############################
+################################ Run clusterProfiler
+
+
+name_of_comparison <- 'ER' 
+background_genes <- 'hallmark_gene_sets' # for our filename
+bg_genes <- hallmark_gene_sets2
+padj_cutoff <- 0.05 # p-adjusted threshold, used to filter out pathways
+genecount_cutoff <- 5 # minimum number of genes in the pathway, used to filter out pathways
+
+
+# Run clusterProfiler on each sub-dataframe
+res <- lapply(names(deg_results_list),
+              function(x) enricher(gene = deg_results_list[[x]]$GeneName,
+                                   TERM2GENE = bg_genes))
+names(res) <- names(deg_results_list)
+
+#Convert the list of enrichResults for each sample_pattern to a dataframe with the pathways
+res_df <- lapply(names(res), function(x) rbind(res[[x]]@result))
+names(res_df) <- names(res)
+res_df <- do.call(rbind, res_df)
+head(res_df)
+
+
+ 
+res_df <- res_df %>% mutate(minuslog10padj = -log10(p.adjust) )
+
+# Subset to those pathways that have p adj < cutoff and gene count > cutoff (you can also do this in the enricher function)
+target_pws <- unique(res_df$ID[res_df$p.adjust < padj_cutoff & res_df$Count > genecount_cutoff]) # select only target pathways have p adjusted < 0.05 and at least 6 genes
+res_df <- res_df[res_df$ID %in% target_pws, ]
+
+
+
+# Exporting results 
+write.csv(res_df, "D:/BulkRNA/Pathway/Results.csv", row.names = TRUE)
+
+#####################################################
+######################################################
+ 
+library(enrichplot)
+library(ggupset)
+library(tidyverse)
+library(org.Hs.eg.db)
+library(DOSE)
+
+# Loading Results
+#res_df <- read.csv( "D:/BulkRNA/Pathway/Results.csv")
+# rownames(res_df) <- res_df$ID
+
+
+
+# Creating enrichResult object
+enrichres <- new("enrichResult",
+                 readable = FALSE,
+                 result = res_df,
+                 pvalueCutoff = 0.05,
+                 pAdjustMethod = "BH",
+                 qvalueCutoff = 0.2,
+                 organism = "human",
+                 ontology = "UNKNOWN",
+                 gene =Genes_in_data,
+                 keytype = "UNKNOWN",
+                 universe = unique(bg_genes$gene),
+                 gene2Symbol = character(0),
+                 geneSets = bg_genes)
+class(enrichres)
+ 
+# Barplot
+barplot(enrichres, showCategory = 20) 
+
+# Sorted barplot
+mutate(enrichres, qscore = -log(p.adjust, base = 10)) %>% 
+  barplot(x = "qscore")
+
+
+######### dot plot
+dotplot(enrichres, showCategory = 15) + ggtitle("ER+ vs ER-")
+
